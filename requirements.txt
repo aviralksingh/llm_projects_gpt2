@@ -1,2 +1,5 @@
 transformers
 matplotlib
+pycuda
+datasets
+yaml

@@ -9,26 +9,8 @@ from torch.nn import functional as F
 from model import GPT, GPTConfig
 from dataloader import DataLoaderLite
 from hellaswag import render_example, iterate_examples
+from train_config import TrainConfig
 
-
-
-max_lr = 6e-4 # From GPT3 paper
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
 # -----------------------------------------------------------------------------
 # helper function for HellaSwag eval
 # takes tokens, mask, and logits, returns the index of the completion with the lowest loss
@@ -55,23 +37,19 @@ def get_most_likely_row(tokens, mask, logits):
 #---------------------------------------------------------------------------#
 
 if __name__=="__main__":
-
+    train_config= TrainConfig("train_config.yaml")
+    device=train_config.device.device
+    device_type=train_config.device.device_type
+    dtype= train_config.config.dtype
     # -----------------------------------------------------------------------------
     # simple launch:
     # python train_gpt2.py
-    # DDP launch for e.g. 8 GPUs:
     # torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
     # run the training loop
     from torch.distributed import init_process_group, destroy_process_group
     from torch.nn.parallel import DistributedDataParallel as DDP
     import torch.distributed as dist
-
-    ampere = False
-    if ampere:
-        dtype=torch.bfloat16
-    else:
-        dtype=torch.float32
 
     # set up DDP (distributed data parallel).
     # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
@@ -95,24 +73,13 @@ if __name__=="__main__":
         ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
-        # Autodetect CUDA device
-        device= "None"
-        if torch.cuda.is_available():
-            device="cuda"
-            torch.cuda.manual_seed(1337)
-        elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available():
-            device="mps"
-        else:
-            device="cpu"
-            torch.manual_seed(1337)
 
-        print(f"using device {device}")
 
-    # added after video, pytorch can be serious about it's device vs. device_type distinction
-    device_type = "cuda" if device.startswith("cuda") else "cpu"
-    torch.manual_seed(1337)
+        print(f"using device {train_config.device.device}")
+
+    torch.manual_seed(train_config.config.train_manual_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(1337)
+        torch.cuda.manual_seed(train_config.config.train_manual_seed)
 
     total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
     B = 4 # micro batch size
@@ -147,8 +114,6 @@ if __name__=="__main__":
     # optimizer= torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), eps=1e-8) # From GPT3 paper B: Details of Modelling
     optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
-
-
     # create the log directory we will write checkpoints to and log to
     log_dir = "log"
     os.makedirs(log_dir, exist_ok=True)
@@ -157,50 +122,9 @@ if __name__=="__main__":
         pass
 
 
-#     for step in range(max_steps):
-#         t0=time.time()
-#         optimizer.zero_grad() # Optimizer will accumulate gradients so its necessary to zero out grad for each back prop
-#         loss_accum = 0.0
-#         for micro_step in range(grad_accum_steps):
-#             x, y = train_loader.next_batch()
-#             x, y = x.to(device), y.to(device)
-#             # added after video, this field is also used by the forward pass.
-#             if ddp:
-#                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-#             with torch.autocast(device_type=device, dtype=torch.dtype):
-#                 logits, loss = model(x, y)
-#             # we have to scale the loss to account for gradient accumulation,
-#             # because the gradients just add on each successive backward().
-#             # addition of gradients corresponds to a SUM in the objective, but
-#             # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-#             loss = loss / grad_accum_steps
-#             loss_accum += loss.detach()
-#             if ddp:
-#                 model.require_backward_grad_sync= (micro_step == grad_accum_steps-1)
-#             loss.backward()
-
-#         if ddp:
-#             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-#         norm= torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # From GPT3 paper B: Details of Modelling
-
-#         #determine and set the learning rate for this iteration
-#         lr= get_lr(step)
-#         for param_group in optimizer.param_groups:
-#             param_group['lr'] = lr
-
-#         optimizer.step()
-#         torch.cuda.synchronize()
-#         t1=time.time()
-#         dt=(t1-t0)*1000
-#         tokens_per_sec= (train_loader.B*train_loader.T * grad_accum_steps)/(t1-t0)
-#         if (ddp and master_process) or (ddp==0):
-#             print(f"step {i} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-
-# if ddp:
-#     destroy_process_group()
-for step in range(max_steps):
+for step in range(train_config.config.train_max_steps):
     t0 = time.time()
-    last_step = (step == max_steps - 1)
+    last_step = (step == train_config.config.train_max_steps - 1)
 
     # once in a while evaluate our validation loss
     if step % 250 == 0 or last_step:
@@ -214,6 +138,10 @@ for step in range(max_steps):
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=dtype):
                     logits, loss = model(x, y)
+                # we have to scale the loss to account for gradient accumulation,
+                # because the gradients just add on each successive backward().
+                # addition of gradients corresponds to a SUM in the objective, but
+                # instead of a SUM we want MEAN. Scale the loss here so it comes out right
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
         if ddp:
@@ -327,7 +255,7 @@ for step in range(max_steps):
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
-    lr = get_lr(step)
+    lr = train_config.get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
